@@ -1,9 +1,10 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
-import { Send, Square, Paperclip, Search } from 'lucide-react';
+import { Send, Square, Paperclip, Search, AudioLines } from 'lucide-react';
 import { toast } from 'sonner';
 import { useAppStore, generateId } from '../../lib/store';
-import { streamChat, streamResearch } from '../../lib/sse';
-import { fetchSavings, getBase } from '../../lib/api';
+import { streamChat, streamResearch, type ChatRequest } from '../../lib/sse';
+import { askClaude, brainstormWithClaude, fetchSavings, getBase } from '../../lib/api';
+import { parseBrainstorm, parseClaudeHandoff } from '../../lib/claude-handoff';
 import { listConnectors, getSyncStatus } from '../../lib/connectors-api';
 import { serializeToolCallArguments } from '../../lib/tool-call';
 import {
@@ -11,7 +12,9 @@ import {
   resolveChatEngine,
 } from '../../lib/chat-telemetry';
 import { MicButton } from './MicButton';
+import { ConversationOrb } from './ConversationOrb';
 import { useSpeech } from '../../hooks/useSpeech';
+import { useConversationMode } from '../../hooks/useConversationMode';
 import type {
   ChatMessage,
   MessageTelemetry,
@@ -78,6 +81,10 @@ function useResearchCorpusSync(enabled: boolean): {
 
   return state;
 }
+
+const VOICE_REPLY_PROMPT =
+  'You are in a live voice conversation. Reply in one to three short, natural '
+  + 'sentences, without markdown, lists, or code, unless the user asks for detail.';
 
 export function InputArea() {
   const [input, setInput] = useState('');
@@ -171,15 +178,19 @@ export function InputArea() {
     resetStream();
   }, [resetStream]);
 
-  const sendMessage = useCallback(async () => {
-    const content = input.trim();
+  // `spoken` carries a conversation-mode turn; typed turns come from `input`.
+  const sendMessage = useCallback(async (spoken?: string) => {
+    const content = (spoken ?? input).trim();
     if (!content || streamState.isStreaming) return;
     if (!selectedModel) {
       toast.error('Pick a model first (⌘K)');
       return;
     }
 
-    setInput('');
+    if (spoken === undefined) setInput('');
+    // "Claude, …" in voice mode goes to the Claude Code agent, not the local model.
+    const brainstormTopic = spoken !== undefined ? parseBrainstorm(content) : null;
+    const claudeTask = spoken !== undefined && !brainstormTopic ? parseClaudeHandoff(content) : null;
 
     let convId = activeId;
     if (!convId) {
@@ -196,10 +207,15 @@ export function InputArea() {
 
     // Build API messages before adding assistant placeholder
     const currentMessages = useAppStore.getState().messages;
-    const apiMessages = currentMessages.map((m) => ({
+    const apiMessages: ChatRequest['messages'] = currentMessages.map((m) => ({
       role: m.role,
       content: m.content,
     }));
+    // Spoken replies are synthesized whole before playback, so a long answer
+    // means a long silence. Ask for conversational brevity in voice mode.
+    if (spoken !== undefined) {
+      apiMessages.unshift({ role: 'system', content: VOICE_REPLY_PROMPT });
+    }
 
     const assistantMsg: ChatMessage = {
       id: generateId(),
@@ -235,7 +251,9 @@ export function InputArea() {
     setStreamState({
       conversationId: convId,
       isStreaming: true,
-      phase: deepResearch ? 'Researching...' : 'Generating...',
+      phase: brainstormTopic
+        ? 'Jarvis and Claude are brainstorming...'
+        : claudeTask ? 'Claude is working...' : deepResearch ? 'Researching...' : 'Generating...',
       elapsedMs: 0,
       activeToolCalls: [],
       content: '',
@@ -244,13 +262,30 @@ export function InputArea() {
       timestamp: Date.now(),
       level: 'info',
       category: 'chat',
-      message: deepResearch
+      message: brainstormTopic
+        ? `Brainstorm with Claude: "${brainstormTopic.slice(0, 80)}"`
+        : claudeTask
+        ? `Claude: "${claudeTask.slice(0, 80)}${claudeTask.length > 80 ? '...' : ''}"`
+        : deepResearch
         ? `Research: "${content.slice(0, 80)}${content.length > 80 ? '...' : ''}"`
         : `Request: "${content.slice(0, 80)}${content.length > 80 ? '...' : ''}" → ${selectedModel}`,
     });
 
     try {
-      if (deepResearch) {
+      if (brainstormTopic) {
+        const report = await brainstormWithClaude(brainstormTopic, {
+          model: selectedModel,
+          rounds: 2,
+          signal: controller.signal,
+        });
+        accumulatedContent = `${report.summary}\n\nThe full conversation is saved in your Jarvis Brainstorms folder on the Desktop.`;
+        routedEngine = 'jarvis+claude';
+        if (!ttftMs) ttftMs = Date.now() - startTime;
+      } else if (claudeTask) {
+        accumulatedContent = await askClaude(claudeTask, { signal: controller.signal });
+        routedEngine = 'claude-code';
+        if (!ttftMs) ttftMs = Date.now() - startTime;
+      } else if (deepResearch) {
         for await (const ev of streamResearch(
           content,
           selectedModel,
@@ -554,6 +589,19 @@ export function InputArea() {
     maxTokens,
   ]);
 
+  const conversation = useConversationMode({ onUtterance: sendMessage });
+
+  useEffect(() => {
+    if (conversation.error) {
+      toast.error(conversation.error, { duration: 8000 });
+    }
+  }, [conversation.error]);
+
+  // Leaving the chat (or losing the model) ends a hands-free session cleanly.
+  useEffect(() => {
+    if (!selectedModel && conversation.active) conversation.stop();
+  }, [selectedModel, conversation.active, conversation.stop]);
+
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
@@ -595,6 +643,12 @@ export function InputArea() {
           </div>
         )}
       </div>
+      <ConversationOrb
+        phase={conversation.phase}
+        level={conversation.level}
+        onTap={conversation.interrupt}
+        onEnd={conversation.stop}
+      />
       <div
         className="flex items-center gap-2 rounded-2xl px-4 py-3 transition-shadow"
         style={{
@@ -628,11 +682,31 @@ export function InputArea() {
             <MicButton
               state={speechState}
               onClick={handleMicClick}
-              disabled={micDisabled}
+              disabled={micDisabled || conversation.active}
               reason={micReason}
             />
             <button
-              onClick={sendMessage}
+              type="button"
+              onClick={conversation.active ? conversation.stop : () => void conversation.start()}
+              disabled={!conversation.active && (micDisabled || !selectedModel || speechState !== 'idle')}
+              aria-pressed={conversation.active}
+              title={
+                conversation.active
+                  ? 'End conversation'
+                  : micReason === 'not-enabled'
+                    ? 'Enable Speech-to-Text in Settings'
+                    : 'Talk hands-free'
+              }
+              className="p-2 rounded-xl transition-all shrink-0 cursor-pointer disabled:opacity-35 disabled:cursor-default"
+              style={{
+                background: conversation.active ? 'var(--color-accent)' : 'transparent',
+                color: conversation.active ? 'var(--color-on-accent, white)' : 'var(--color-text-secondary)',
+              }}
+            >
+              <AudioLines size={16} />
+            </button>
+            <button
+              onClick={() => void sendMessage()}
               disabled={streamState.isStreaming || !input.trim() || modelLoading || !selectedModel}
               title={selectedModel ? 'Send message' : 'Pick a model first (⌘K)'}
               className="p-2 rounded-xl transition-colors shrink-0 cursor-pointer disabled:opacity-30 disabled:cursor-default"

@@ -34,6 +34,16 @@ class AgentMessageRequest(BaseModel):
     message: str
 
 
+class ClaudeAskRequest(BaseModel):
+    message: str
+
+
+class BrainstormRequest(BaseModel):
+    topic: str
+    rounds: int = 3
+    model: Optional[str] = None
+
+
 class SpeechSynthesizeRequest(BaseModel):
     text: str
     voice_id: Optional[str] = None
@@ -197,6 +207,112 @@ async def message_agent(agent_id: str, req: AgentMessageRequest, request: Reques
         return {"status": "sent", "content": result.content}
     except ImportError:
         raise HTTPException(status_code=501, detail="Agent tools not available")
+
+
+# Read-only by default: a misheard voice command should never be able to
+# delete or rewrite files. Widen deliberately if you want Claude to act.
+_CLAUDE_ASK_TOOLS = ["Read", "Glob", "Grep", "WebSearch", "WebFetch"]
+_CLAUDE_ASK_SUFFIX = (
+    "\n\n(This request was spoken aloud and your answer will be read back. "
+    "Answer in two to four short spoken sentences, with no markdown.)"
+)
+
+
+def _read_only_claude(request: Request, agent_cls: Any) -> Any:
+    state = request.app.state
+    return agent_cls(
+        None,
+        "claude-code",
+        bus=getattr(state, "bus", None),
+        workspace=str(Path.home()),
+        allowed_tools=_CLAUDE_ASK_TOOLS,
+        capability_policy=getattr(state, "capability_policy", None),
+        rate_limiter=getattr(state, "rate_limiter", None),
+        agent_id="server:claude-ask",
+    )
+
+
+@agents_router.post("/claude/ask")
+async def claude_ask(req: ClaudeAskRequest, request: Request):
+    """Hand one request to the Claude Code agent and return its final answer.
+
+    Uses the machine's existing Claude Code login (or ``ANTHROPIC_API_KEY``),
+    runs from the user's home directory with read-only tools, and blocks until
+    Claude finishes.
+    """
+    message = req.message.strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="No message provided.")
+    try:
+        from openjarvis.agents.claude_code import ClaudeCodeAgent
+    except ImportError:
+        raise HTTPException(status_code=501, detail="Claude Code agent not available")
+
+    agent = _read_only_claude(request, ClaudeCodeAgent)
+    try:
+        result = await asyncio.to_thread(agent.run, message + _CLAUDE_ASK_SUFFIX)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    if result.metadata.get("error"):
+        raise HTTPException(status_code=502, detail=result.content or "Claude failed")
+    return {"content": result.content, "turns": result.turns}
+
+
+@agents_router.post("/brainstorm")
+async def brainstorm(req: BrainstormRequest, request: Request):
+    """Jarvis (local model) and Claude trade ideas, then Jarvis reports back.
+
+    Saves the full exchange to ``~/Desktop/Jarvis Brainstorms`` and returns
+    Jarvis's spoken summary plus the report path.
+    """
+    topic = req.topic.strip()
+    if not topic:
+        raise HTTPException(status_code=400, detail="No topic provided.")
+    try:
+        from openjarvis.agents.claude_code import ClaudeCodeAgent
+    except ImportError:
+        raise HTTPException(status_code=501, detail="Claude Code agent not available")
+    from datetime import datetime
+
+    from openjarvis.core.types import Message, Role
+    from openjarvis.server.brainstorm import run_brainstorm, save_report
+
+    state = request.app.state
+    engine = getattr(state, "engine", None)
+    model = req.model or getattr(state, "model", None)
+    if engine is None or not model:
+        raise HTTPException(status_code=503, detail="No local model available")
+
+    def jarvis(system: str, user: str) -> str:
+        result = engine.generate(
+            [
+                Message(role=Role.SYSTEM, content=system),
+                Message(role=Role.USER, content=user),
+            ],
+            model=model,
+            temperature=0.8,
+            max_tokens=400,
+        )
+        return result.get("content", "")
+
+    def claude(prompt: str) -> str:
+        result = _read_only_claude(request, ClaudeCodeAgent).run(prompt)
+        if result.metadata.get("error"):
+            raise RuntimeError(result.content or "Claude failed")
+        return result.content
+
+    rounds = max(1, min(req.rounds, 6))
+    try:
+        result = await asyncio.to_thread(run_brainstorm, topic, rounds, jarvis, claude)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    folder = Path.home() / "Desktop" / "Jarvis Brainstorms"
+    save_report(result, folder, datetime.now())
+    return {
+        "summary": result.summary,
+        "report_path": result.report_path,
+        "turns": [{"speaker": who, "text": text} for who, text in result.turns],
+    }
 
 
 # ---- Memory routes ----
