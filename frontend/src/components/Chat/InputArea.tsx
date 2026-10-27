@@ -3,7 +3,8 @@ import { Send, Square, Paperclip, Search, AudioLines } from 'lucide-react';
 import { toast } from 'sonner';
 import { useAppStore, generateId } from '../../lib/store';
 import { streamChat, streamResearch, type ChatRequest } from '../../lib/sse';
-import { fetchSavings, getBase } from '../../lib/api';
+import { askClaude, fetchSavings, getBase } from '../../lib/api';
+import { parseClaudeHandoff } from '../../lib/claude-handoff';
 import { listConnectors, getSyncStatus } from '../../lib/connectors-api';
 import { serializeToolCallArguments } from '../../lib/tool-call';
 import {
@@ -187,6 +188,8 @@ export function InputArea() {
     }
 
     if (spoken === undefined) setInput('');
+    // "Claude, …" in voice mode goes to the Claude Code agent, not the local model.
+    const claudeTask = spoken !== undefined ? parseClaudeHandoff(content) : null;
 
     let convId = activeId;
     if (!convId) {
@@ -247,7 +250,7 @@ export function InputArea() {
     setStreamState({
       conversationId: convId,
       isStreaming: true,
-      phase: deepResearch ? 'Researching...' : 'Generating...',
+      phase: claudeTask ? 'Claude is working...' : deepResearch ? 'Researching...' : 'Generating...',
       elapsedMs: 0,
       activeToolCalls: [],
       content: '',
@@ -256,13 +259,19 @@ export function InputArea() {
       timestamp: Date.now(),
       level: 'info',
       category: 'chat',
-      message: deepResearch
+      message: claudeTask
+        ? `Claude: "${claudeTask.slice(0, 80)}${claudeTask.length > 80 ? '...' : ''}"`
+        : deepResearch
         ? `Research: "${content.slice(0, 80)}${content.length > 80 ? '...' : ''}"`
         : `Request: "${content.slice(0, 80)}${content.length > 80 ? '...' : ''}" → ${selectedModel}`,
     });
 
     try {
-      if (deepResearch) {
+      if (claudeTask) {
+        accumulatedContent = await askClaude(claudeTask, { signal: controller.signal });
+        routedEngine = 'claude-code';
+        if (!ttftMs) ttftMs = Date.now() - startTime;
+      } else if (deepResearch) {
         for await (const ev of streamResearch(
           content,
           selectedModel,

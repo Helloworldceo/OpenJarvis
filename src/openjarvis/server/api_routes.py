@@ -34,6 +34,10 @@ class AgentMessageRequest(BaseModel):
     message: str
 
 
+class ClaudeAskRequest(BaseModel):
+    message: str
+
+
 class SpeechSynthesizeRequest(BaseModel):
     text: str
     voice_id: Optional[str] = None
@@ -197,6 +201,51 @@ async def message_agent(agent_id: str, req: AgentMessageRequest, request: Reques
         return {"status": "sent", "content": result.content}
     except ImportError:
         raise HTTPException(status_code=501, detail="Agent tools not available")
+
+
+# Read-only by default: a misheard voice command should never be able to
+# delete or rewrite files. Widen deliberately if you want Claude to act.
+_CLAUDE_ASK_TOOLS = ["Read", "Glob", "Grep", "WebSearch", "WebFetch"]
+_CLAUDE_ASK_SUFFIX = (
+    "\n\n(This request was spoken aloud and your answer will be read back. "
+    "Answer in two to four short spoken sentences, with no markdown.)"
+)
+
+
+@agents_router.post("/claude/ask")
+async def claude_ask(req: ClaudeAskRequest, request: Request):
+    """Hand one request to the Claude Code agent and return its final answer.
+
+    Uses the machine's existing Claude Code login (or ``ANTHROPIC_API_KEY``),
+    runs from the user's home directory with read-only tools, and blocks until
+    Claude finishes.
+    """
+    message = req.message.strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="No message provided.")
+    try:
+        from openjarvis.agents.claude_code import ClaudeCodeAgent
+    except ImportError:
+        raise HTTPException(status_code=501, detail="Claude Code agent not available")
+
+    state = request.app.state
+    agent = ClaudeCodeAgent(
+        None,
+        "claude-code",
+        bus=getattr(state, "bus", None),
+        workspace=str(Path.home()),
+        allowed_tools=_CLAUDE_ASK_TOOLS,
+        capability_policy=getattr(state, "capability_policy", None),
+        rate_limiter=getattr(state, "rate_limiter", None),
+        agent_id="server:claude-ask",
+    )
+    try:
+        result = await asyncio.to_thread(agent.run, message + _CLAUDE_ASK_SUFFIX)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    if result.metadata.get("error"):
+        raise HTTPException(status_code=502, detail=result.content or "Claude failed")
+    return {"content": result.content, "turns": result.turns}
 
 
 # ---- Memory routes ----

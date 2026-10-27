@@ -425,6 +425,31 @@ export async function synthesizeSpeech(
   return res.blob();
 }
 
+/** Hand one request to the Claude Code agent and wait for its final answer. */
+export async function askClaude(
+  message: string,
+  opts: { signal?: AbortSignal } = {},
+): Promise<string> {
+  const res = await apiFetch(`/v1/agents/claude/ask`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ message }),
+    signal: opts.signal,
+  });
+  if (!res.ok) {
+    let detail = '';
+    try {
+      const body = await res.json();
+      detail = typeof body.detail === 'string' ? body.detail : '';
+    } catch {
+      // Keep the status-only message below when the body is not JSON.
+    }
+    throw new Error(detail || `Claude request failed: ${res.status}`);
+  }
+  const body = await res.json();
+  return typeof body.content === 'string' ? body.content : '';
+}
+
 export async function fetchTtsHealth(): Promise<TtsHealth> {
   const res = await apiFetch(`/v1/speech/tts/health`);
   if (!res.ok) return { available: false };
