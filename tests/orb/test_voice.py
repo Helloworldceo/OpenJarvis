@@ -42,3 +42,17 @@ def test_frame_rms():
     assert frame_rms(np.zeros(10, dtype=np.int16)) == 0.0
     loud = np.full(10, 32767, dtype=np.int16)
     assert frame_rms(loud) > 0.99
+
+
+def test_split_sentences_streams_and_merges_short_ones():
+    from openjarvis.orb.voice import split_sentences
+
+    chunks = ["Hi. It is ", "eight in the morning in Tokyo. ", "Have a ", "nice day!"]
+    out = list(split_sentences(chunks))
+    assert out == ["Hi. It is eight in the morning in Tokyo.", "Have a nice day!"]
+
+
+def test_split_sentences_flushes_tail_without_punctuation():
+    from openjarvis.orb.voice import split_sentences
+
+    assert list(split_sentences(["no punctuation here"])) == ["no punctuation here"]

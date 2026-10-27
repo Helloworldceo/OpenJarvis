@@ -9,13 +9,14 @@ so a conversation does not need the wake word on every turn.
 from __future__ import annotations
 
 import io
+import json
 import os
 import queue
 import re
 import threading
 import wave
 from dataclasses import dataclass, field
-from typing import Callable, List, Optional
+from typing import Callable, Iterable, Iterator, List, Optional
 
 import numpy as np
 
@@ -65,7 +66,7 @@ class Endpointer:
     def __init__(
         self,
         threshold: float = 0.015,
-        silence_s: float = 1.0,
+        silence_s: float = 0.7,
         min_speech_s: float = 0.25,
         max_s: float = 30.0,
         idle_s: float = 8.0,
@@ -152,6 +153,31 @@ class JarvisClient:
         r.raise_for_status()
         return r.json()["choices"][0]["message"]["content"]
 
+    def chat_stream(self, history: List[dict]) -> Iterator[str]:
+        """Yield reply text as the local model writes it."""
+        body = {
+            "model": self.model,
+            "messages": [{"role": "system", "content": VOICE_PROMPT}, *history],
+            "max_tokens": 300,
+            "stream": True,
+        }
+        with self._http.stream("POST", "/v1/chat/completions", json=body) as r:
+            r.raise_for_status()
+            for line in r.iter_lines():
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data)
+                except ValueError:
+                    continue
+                choices = chunk.get("choices") or [{}]
+                delta = choices[0].get("delta", {}).get("content")
+                if delta:
+                    yield delta
+
     def ask_claude(self, task: str) -> str:
         r = self._http.post("/v1/agents/claude/ask", json={"message": task})
         r.raise_for_status()
@@ -172,6 +198,35 @@ class JarvisClient:
         r = self._http.post("/v1/speech/synthesize", json={"text": text})
         r.raise_for_status()
         return r.content
+
+
+_SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
+
+
+def split_sentences(chunks: Iterable[str], min_len: int = 24) -> Iterator[str]:
+    """Regroup streamed text into speakable sentences as soon as each ends.
+
+    Very short sentences are merged with the next one so playback is not a
+    string of tiny clips.
+    """
+    buf = ""
+    for chunk in chunks:
+        buf += chunk
+        while True:
+            parts = _SENTENCE_END.split(buf, maxsplit=1)
+            if len(parts) < 2:
+                break
+            head, rest = parts
+            if len(head) < min_len and rest:
+                # Too short to say alone: wait for the next sentence too.
+                nxt = _SENTENCE_END.split(rest, maxsplit=1)
+                if len(nxt) < 2:
+                    break
+                head, rest = head + " " + nxt[0], nxt[1]
+            yield head.strip()
+            buf = rest
+    if buf.strip():
+        yield buf.strip()
 
 
 def _speakable(text: str) -> str:
@@ -295,8 +350,7 @@ class VoiceLoop(threading.Thread):
                 text = self.client.transcribe(to_wav(audio))
                 if not text:
                     return
-                reply = self._answer(text)
-                self._speak(reply)
+                self._answer_aloud(text)
             except Exception as exc:  # network, server, or audio failure
                 self._set("error", message=str(exc)[:200])
                 return
@@ -323,37 +377,63 @@ class VoiceLoop(threading.Thread):
                 return None
         return None
 
-    def _answer(self, text: str) -> str:
+    def _reply_chunks(self, text: str) -> Iterator[str]:
         topic = parse_brainstorm(text)
         if topic:
-            return self.client.brainstorm(topic)
+            yield self.client.brainstorm(topic)
+            return
         task = parse_claude(text)
         if task:
-            return self.client.ask_claude(task)
+            yield self.client.ask_claude(task)
+            return
         self.state.history.append({"role": "user", "content": text})
-        reply = self.client.chat(self.state.history[-8:])
+        reply = ""
+        for delta in self.client.chat_stream(self.state.history[-8:]):
+            reply += delta
+            yield delta
         self.state.history.append({"role": "assistant", "content": reply})
-        return reply
 
-    def _speak(self, reply: str) -> None:
+    def _answer_aloud(self, text: str) -> None:
+        """Speak the reply sentence by sentence while the rest is prepared."""
         import sounddevice as sd
         import soundfile as sf
 
-        text = _speakable(reply)
-        if not text:
-            return
-        data, rate = sf.read(io.BytesIO(self.client.synthesize(text)), dtype="float32")
+        clips: "queue.Queue[object]" = queue.Queue(maxsize=4)
+        failure: List[BaseException] = []
         self._interrupt.clear()
-        self._set("speaking", message=text)
-        sd.play(data, rate)
-        duration = len(data) / rate
-        waited = 0.0
-        while waited < duration + 0.3:
-            if self._interrupt.wait(0.1):
-                sd.stop()
+
+        def produce() -> None:
+            try:
+                for sentence in split_sentences(self._reply_chunks(text)):
+                    if self._interrupt.is_set():
+                        break
+                    spoken = _speakable(sentence)
+                    if not spoken:
+                        continue
+                    wav = self.client.synthesize(spoken)
+                    clips.put(sf.read(io.BytesIO(wav), dtype="float32"))
+            except BaseException as exc:  # surfaced on the voice thread below
+                failure.append(exc)
+            finally:
+                clips.put(None)
+
+        threading.Thread(target=produce, daemon=True).start()
+        while True:
+            clip = clips.get()
+            if clip is None or self._interrupt.is_set():
                 break
-            waited += 0.1
-        sd.stop()
+            data, rate = clip
+            self._set("speaking")
+            sd.play(data, rate)
+            deadline = len(data) / rate + 0.2
+            waited = 0.0
+            while waited < deadline:
+                if self._interrupt.wait(0.05):
+                    break
+                waited += 0.05
+            sd.stop()
+        if failure and not self._interrupt.is_set():
+            raise failure[0]
 
 
 def default_client() -> JarvisClient:
