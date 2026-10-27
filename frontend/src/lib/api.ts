@@ -450,6 +450,36 @@ export async function askClaude(
   return typeof body.content === 'string' ? body.content : '';
 }
 
+export interface BrainstormResult {
+  summary: string;
+  report_path: string;
+  turns: Array<{ speaker: string; text: string }>;
+}
+
+/** Let Jarvis (local model) and Claude trade ideas, then return Jarvis's report. */
+export async function brainstormWithClaude(
+  topic: string,
+  opts: { model?: string; rounds?: number; signal?: AbortSignal } = {},
+): Promise<BrainstormResult> {
+  const res = await apiFetch(`/v1/agents/brainstorm`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ topic, model: opts.model, rounds: opts.rounds }),
+    signal: opts.signal,
+  });
+  if (!res.ok) {
+    let detail = '';
+    try {
+      const body = await res.json();
+      detail = typeof body.detail === 'string' ? body.detail : '';
+    } catch {
+      // Keep the status-only message below when the body is not JSON.
+    }
+    throw new Error(detail || `Brainstorm failed: ${res.status}`);
+  }
+  return res.json();
+}
+
 export async function fetchTtsHealth(): Promise<TtsHealth> {
   const res = await apiFetch(`/v1/speech/tts/health`);
   if (!res.ok) return { available: false };

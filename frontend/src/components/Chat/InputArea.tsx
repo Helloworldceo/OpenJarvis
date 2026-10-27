@@ -3,8 +3,8 @@ import { Send, Square, Paperclip, Search, AudioLines } from 'lucide-react';
 import { toast } from 'sonner';
 import { useAppStore, generateId } from '../../lib/store';
 import { streamChat, streamResearch, type ChatRequest } from '../../lib/sse';
-import { askClaude, fetchSavings, getBase } from '../../lib/api';
-import { parseClaudeHandoff } from '../../lib/claude-handoff';
+import { askClaude, brainstormWithClaude, fetchSavings, getBase } from '../../lib/api';
+import { parseBrainstorm, parseClaudeHandoff } from '../../lib/claude-handoff';
 import { listConnectors, getSyncStatus } from '../../lib/connectors-api';
 import { serializeToolCallArguments } from '../../lib/tool-call';
 import {
@@ -189,7 +189,8 @@ export function InputArea() {
 
     if (spoken === undefined) setInput('');
     // "Claude, …" in voice mode goes to the Claude Code agent, not the local model.
-    const claudeTask = spoken !== undefined ? parseClaudeHandoff(content) : null;
+    const brainstormTopic = spoken !== undefined ? parseBrainstorm(content) : null;
+    const claudeTask = spoken !== undefined && !brainstormTopic ? parseClaudeHandoff(content) : null;
 
     let convId = activeId;
     if (!convId) {
@@ -250,7 +251,9 @@ export function InputArea() {
     setStreamState({
       conversationId: convId,
       isStreaming: true,
-      phase: claudeTask ? 'Claude is working...' : deepResearch ? 'Researching...' : 'Generating...',
+      phase: brainstormTopic
+        ? 'Jarvis and Claude are brainstorming...'
+        : claudeTask ? 'Claude is working...' : deepResearch ? 'Researching...' : 'Generating...',
       elapsedMs: 0,
       activeToolCalls: [],
       content: '',
@@ -259,7 +262,9 @@ export function InputArea() {
       timestamp: Date.now(),
       level: 'info',
       category: 'chat',
-      message: claudeTask
+      message: brainstormTopic
+        ? `Brainstorm with Claude: "${brainstormTopic.slice(0, 80)}"`
+        : claudeTask
         ? `Claude: "${claudeTask.slice(0, 80)}${claudeTask.length > 80 ? '...' : ''}"`
         : deepResearch
         ? `Research: "${content.slice(0, 80)}${content.length > 80 ? '...' : ''}"`
@@ -267,7 +272,16 @@ export function InputArea() {
     });
 
     try {
-      if (claudeTask) {
+      if (brainstormTopic) {
+        const report = await brainstormWithClaude(brainstormTopic, {
+          model: selectedModel,
+          rounds: 2,
+          signal: controller.signal,
+        });
+        accumulatedContent = `${report.summary}\n\nThe full conversation is saved in your Jarvis Brainstorms folder on the Desktop.`;
+        routedEngine = 'jarvis+claude';
+        if (!ttftMs) ttftMs = Date.now() - startTime;
+      } else if (claudeTask) {
         accumulatedContent = await askClaude(claudeTask, { signal: controller.signal });
         routedEngine = 'claude-code';
         if (!ttftMs) ttftMs = Date.now() - startTime;

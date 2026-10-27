@@ -14,3 +14,17 @@ export function parseClaudeHandoff(text: string): string | null {
   const task = match[1].trim();
   return task.length > 0 ? task : null;
 }
+
+const BRAINSTORM =
+  /^\s*(?:(?:hey|ok|okay)[\s,]+)?(?:jarvis[\s,]+)?(?:(?:let'?s|please|can you|could you)\s+)?brainstorm\b(?:\s+with\s+(?:claude|cloud|clod)\b)?(?:\s+(?:about|on|for))?[\s,.:;!?-]*(.*)$/is;
+
+/**
+ * Return the topic of a spoken "brainstorm with Claude about …" request, or
+ * null when the turn is not a brainstorm request.
+ */
+export function parseBrainstorm(text: string): string | null {
+  const match = BRAINSTORM.exec(text);
+  if (!match) return null;
+  const topic = match[1].trim().replace(/[.!?]+$/, '');
+  return topic.length > 0 ? topic : null;
+}
