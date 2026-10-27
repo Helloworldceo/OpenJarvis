@@ -754,3 +754,61 @@
   background: var(--color-accent);
   text-decoration: none;
 }
+/* Hands-free conversation mode orb */
+.conversation-orb {
+  position: relative;
+  width: 44px;
+  height: 44px;
+  border-radius: 9999px;
+  border: none;
+  padding: 0;
+  background: radial-gradient(circle at 35% 30%, color-mix(in srgb, var(--color-accent) 35%, white), var(--color-accent) 70%);
+  box-shadow: 0 0 18px -2px var(--color-accent-glow);
+  transition: transform 80ms linear;
+}
+.conversation-orb__ring {
+  position: absolute;
+  inset: -6px;
+  border-radius: 9999px;
+  border: 2px solid transparent;
+  pointer-events: none;
+}
+.conversation-orb--listening .conversation-orb__ring {
+  border-color: color-mix(in srgb, var(--color-accent) 45%, transparent);
+  animation: conversation-orb-breathe 2s ease-in-out infinite;
+}
+.conversation-orb--transcribing .conversation-orb__ring,
+.conversation-orb--thinking .conversation-orb__ring {
+  border-top-color: var(--color-accent);
+  border-right-color: color-mix(in srgb, var(--color-accent) 40%, transparent);
+  animation: conversation-orb-spin 0.9s linear infinite;
+}
+.conversation-orb--thinking {
+  animation: conversation-orb-dim 1.6s ease-in-out infinite;
+}
+.conversation-orb--speaking .conversation-orb__ring {
+  border-color: var(--color-accent);
+  animation: conversation-orb-wave 1.1s ease-out infinite;
+}
+@keyframes conversation-orb-breathe {
+  0%, 100% { opacity: 0.4; transform: scale(1); }
+  50% { opacity: 1; transform: scale(1.08); }
+}
+@keyframes conversation-orb-spin {
+  to { transform: rotate(360deg); }
+}
+@keyframes conversation-orb-dim {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.65; }
+}
+@keyframes conversation-orb-wave {
+  0% { opacity: 0.9; transform: scale(1); }
+  100% { opacity: 0; transform: scale(1.6); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .conversation-orb,
+  .conversation-orb__ring {
+    animation: none !important;
+    transition: none !important;
+  }
+}
