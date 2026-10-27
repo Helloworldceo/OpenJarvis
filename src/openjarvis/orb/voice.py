@@ -240,6 +240,9 @@ class OrbState:
     phase: str = "idle"  # idle, listening, thinking, speaking, muted, error
     level: float = 0.0
     message: str = ""
+    # Live caption shown beside the orb: what the user said, or Jarvis's reply.
+    caption: str = ""
+    speaker: str = ""  # "you", "jarvis", or ""
     history: List[dict] = field(default_factory=list)
 
 
@@ -247,6 +250,7 @@ class VoiceLoop(threading.Thread):
     """Background thread: wake word → record → ask Jarvis → speak → follow-up."""
 
     FOLLOW_UP_S = 6.0
+    PARTIAL_EVERY_S = 1.0
     WAKE_THRESHOLD = 0.5
 
     def __init__(
@@ -263,6 +267,7 @@ class VoiceLoop(threading.Thread):
         self._manual = threading.Event()
         self._interrupt = threading.Event()
         self._stop = threading.Event()
+        self._turn: Optional[object] = None
 
     # -- controls (called from the UI thread) -------------------------------
     def tap(self) -> None:
@@ -280,11 +285,25 @@ class VoiceLoop(threading.Thread):
         self._stop.set()
 
     # -- internals -----------------------------------------------------------
-    def _set(self, phase: str, level: float = 0.0, message: str = "") -> None:
+    def _set(
+        self,
+        phase: str,
+        level: float = 0.0,
+        message: str = "",
+        caption: Optional[str] = None,
+        speaker: Optional[str] = None,
+    ) -> None:
         self.state.phase = phase
         self.state.level = level
         self.state.message = message
+        if caption is not None:
+            self.state.caption = caption
+        if speaker is not None:
+            self.state.speaker = speaker
         self.on_change(self.state)
+
+    def _caption(self, speaker: str, text: str) -> None:
+        self._set(self.state.phase, self.state.level, caption=text, speaker=speaker)
 
     def _drain(self) -> None:
         while not self._frames.empty():
@@ -337,7 +356,7 @@ class VoiceLoop(threading.Thread):
                 self._drain()
                 wake.reset()
                 if not self._muted.is_set():
-                    self._set("idle")
+                    self._set("idle", caption="", speaker="")
 
     def _conversation(self, idle_s: float) -> None:
         """Answer turns until the user stops talking."""
@@ -350,18 +369,40 @@ class VoiceLoop(threading.Thread):
                 text = self.client.transcribe(to_wav(audio))
                 if not text:
                     return
+                self._set("thinking", caption=text, speaker="you")
                 self._answer_aloud(text)
             except Exception as exc:  # network, server, or audio failure
-                self._set("error", message=str(exc)[:200])
+                self._set(
+                    "error",
+                    message=str(exc)[:200],
+                    caption="Couldn't reach Jarvis. Is the server running?",
+                    speaker="",
+                )
                 return
             self._drain()
             idle_s = self.FOLLOW_UP_S
 
     def _record(self, idle_s: float) -> Optional[np.ndarray]:
         self._drain()
-        self._set("listening")
+        self._set("listening", caption="", speaker="you")
         ep = Endpointer(idle_s=idle_s)
         chunks: List[np.ndarray] = []
+        busy = threading.Event()  # one partial transcription in flight at a time
+        since_partial = 0.0
+        turn = object()
+        self._turn = turn
+
+        def partial(audio: np.ndarray) -> None:
+            try:
+                text = self.client.transcribe(to_wav(audio))
+                # Ignore late results once this recording has ended.
+                if text and self._turn is turn and self.state.phase == "listening":
+                    self._caption("you", text)
+            except Exception:
+                pass  # live captions are best effort
+            finally:
+                busy.clear()
+
         while not self._stop.is_set():
             try:
                 frame = self._frames.get(timeout=1.0)
@@ -371,10 +412,15 @@ class VoiceLoop(threading.Thread):
             chunks.append(frame)
             self._set("listening", level=min(1.0, rms * 10))
             decision = ep.push(rms, FRAME / SAMPLE_RATE)
-            if decision == "done":
-                return np.concatenate(chunks)
-            if decision == "idle":
-                return None
+            since_partial += FRAME / SAMPLE_RATE
+            if decision in ("done", "idle"):
+                self._turn = None
+                return np.concatenate(chunks) if decision == "done" else None
+            if ep.heard and since_partial >= self.PARTIAL_EVERY_S and not busy.is_set():
+                busy.set()
+                since_partial = 0.0
+                snapshot = np.concatenate(chunks)
+                threading.Thread(target=partial, args=(snapshot,), daemon=True).start()
         return None
 
     def _reply_chunks(self, text: str) -> Iterator[str]:
@@ -411,19 +457,24 @@ class VoiceLoop(threading.Thread):
                     if not spoken:
                         continue
                     wav = self.client.synthesize(spoken)
-                    clips.put(sf.read(io.BytesIO(wav), dtype="float32"))
+                    data, rate = sf.read(io.BytesIO(wav), dtype="float32")
+                    clips.put((data, rate, spoken))
             except BaseException as exc:  # surfaced on the voice thread below
                 failure.append(exc)
             finally:
                 clips.put(None)
 
         threading.Thread(target=produce, daemon=True).start()
+        said = ""
         while True:
             clip = clips.get()
             if clip is None or self._interrupt.is_set():
                 break
-            data, rate = clip
-            self._set("speaking")
+            data, rate, sentence = clip
+            said = f"{said} {sentence}".strip()
+            # Keep the bubble short: show the tail of what has been said.
+            shown = said if len(said) <= 220 else "…" + said[-220:]
+            self._set("speaking", caption=shown, speaker="jarvis")
             sd.play(data, rate)
             deadline = len(data) / rate + 0.2
             waited = 0.0

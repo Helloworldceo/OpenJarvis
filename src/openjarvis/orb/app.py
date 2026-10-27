@@ -21,6 +21,7 @@ from AppKit import (
     NSBezierPath,
     NSColor,
     NSEvent,
+    NSFont,
     NSGradient,
     NSMakeRect,
     NSMenu,
@@ -28,7 +29,9 @@ from AppKit import (
     NSPanel,
     NSScreen,
     NSStatusWindowLevel,
+    NSTextField,
     NSView,
+    NSWindowAbove,
     NSWindowCollectionBehaviorCanJoinAllSpaces,
     NSWindowCollectionBehaviorFullScreenAuxiliary,
     NSWindowCollectionBehaviorStationary,
@@ -41,6 +44,8 @@ from PyObjCTools import AppHelper
 from openjarvis.orb.voice import OrbState, VoiceLoop, default_client
 
 SIZE = 64  # orb diameter in points
+CAPTION_W = 300  # caption bubble width
+CAPTION_GAP = 6
 PAD = 14  # room for the glow around it
 _POS_KEY = "JarvisOrbOrigin"
 
@@ -181,6 +186,77 @@ class OrbView(NSView):
             self.loop.set_muted(self.phase != "muted")
 
 
+class Caption:
+    """Speech bubble beside the orb showing live captions.
+
+    It is a child window of the orb panel, so it moves with the orb when
+    dragged; it sits on whichever side of the orb has room.
+    """
+
+    def __init__(self, orb_panel):
+        self.orb = orb_panel
+        self.panel = NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
+            NSMakeRect(0, 0, CAPTION_W, 40),
+            NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel,
+            NSBackingStoreBuffered,
+            False,
+        )
+        self.panel.setFloatingPanel_(True)
+        self.panel.setLevel_(NSStatusWindowLevel)
+        self.panel.setOpaque_(False)
+        self.panel.setBackgroundColor_(NSColor.clearColor())
+        self.panel.setHasShadow_(True)
+        self.panel.setIgnoresMouseEvents_(True)
+        self.panel.setCollectionBehavior_(
+            NSWindowCollectionBehaviorCanJoinAllSpaces
+            | NSWindowCollectionBehaviorFullScreenAuxiliary
+        )
+
+        box = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, CAPTION_W, 40))
+        box.setWantsLayer_(True)
+        box.layer().setCornerRadius_(12)
+        box.layer().setBackgroundColor_(
+            NSColor.colorWithCalibratedWhite_alpha_(0.08, 0.88).CGColor()
+        )
+        self.label = NSTextField.wrappingLabelWithString_("")
+        self.label.setFont_(NSFont.systemFontOfSize_(13))
+        self.label.setTextColor_(NSColor.whiteColor())
+        self.label.setFrame_(NSMakeRect(12, 8, CAPTION_W - 24, 24))
+        box.addSubview_(self.label)
+        self.box = box
+        self.panel.setContentView_(box)
+        self.attached = False
+
+    def show(self, speaker: str, text: str) -> None:
+        if not text:
+            self.hide()
+            return
+        who = {"you": "You", "jarvis": "Jarvis"}.get(speaker, "")
+        self.label.setStringValue_(f"{who}: {text}" if who else text)
+        size = self.label.sizeThatFits_((CAPTION_W - 24, 10_000))
+        h = min(max(size.height, 18), 160) + 16
+        self.label.setFrame_(NSMakeRect(12, 8, CAPTION_W - 24, h - 16))
+
+        orb = self.orb.frame()
+        screen = (self.orb.screen() or NSScreen.mainScreen()).visibleFrame()
+        left_x = orb.origin.x - CAPTION_W - CAPTION_GAP + PAD
+        right_x = orb.origin.x + orb.size.width + CAPTION_GAP - PAD
+        x = left_x if left_x >= screen.origin.x else right_x
+        y = orb.origin.y + (orb.size.height - h) / 2
+        self.panel.setFrame_display_(NSMakeRect(x, y, CAPTION_W, h), True)
+        self.box.setFrame_(NSMakeRect(0, 0, CAPTION_W, h))
+        if not self.attached:
+            self.orb.addChildWindow_ordered_(self.panel, NSWindowAbove)
+            self.attached = True
+        self.panel.orderFrontRegardless()
+
+    def hide(self) -> None:
+        if self.attached:
+            self.orb.removeChildWindow_(self.panel)
+            self.attached = False
+        self.panel.orderOut_(None)
+
+
 class AppDelegate(NSObject):
     def applicationDidFinishLaunching_(self, _note):
         side = SIZE + 2 * PAD
@@ -216,6 +292,7 @@ class AppDelegate(NSObject):
         panel.setContentView_(view)
         panel.orderFrontRegardless()
         self.panel, self.view = panel, view
+        self.caption = Caption(panel)
 
         schedule = (
             NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_
@@ -223,17 +300,26 @@ class AppDelegate(NSObject):
         self.timer = schedule(1 / 30, view, "tick:", None, True)
 
         def on_change(state: OrbState) -> None:
-            phase, level, message = state.phase, state.level, state.message
-            AppHelper.callAfter(self.apply, phase, level, message)
+            AppHelper.callAfter(
+                self.apply,
+                state.phase,
+                state.level,
+                state.message,
+                state.speaker,
+                state.caption,
+            )
 
         self.loop = VoiceLoop(default_client(), on_change)
         view.loop = self.loop
         self.loop.start()
 
     @objc.python_method
-    def apply(self, phase, level, message):
+    def apply(self, phase, level, message, speaker, caption):
         self.view.phase = phase
         self.view.level = level
+        if caption != getattr(self, "_shown", None):
+            self._shown = caption
+            self.caption.show(speaker, caption)
         tip = TIPS.get(phase, "")
         if phase == "error" and message:
             tip = f"{tip}\n{message}"
